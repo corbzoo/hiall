@@ -20,9 +20,14 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
 import java.util.Properties;
 import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.ThreadLocalRandom;
 
 public class HiAllClient implements ClientModInitializer {
     private static final boolean AUTO_START_ON_JOIN = false;
@@ -30,6 +35,7 @@ public class HiAllClient implements ClientModInitializer {
     private static String text = "hi lol";
     private static double delaySeconds = 3.0;
     private static String command = "msg";
+    private static final Set<String> blacklist = new TreeSet<>(); // stored lowercase
 
     private static final Set<String> done = new HashSet<>();
     private static boolean running = false;
@@ -49,6 +55,10 @@ public class HiAllClient implements ClientModInitializer {
             text = props.getProperty("text", text);
             command = props.getProperty("command", command);
             delaySeconds = Double.parseDouble(props.getProperty("delay", String.valueOf(delaySeconds)));
+            String bl = props.getProperty("blacklist", "");
+            for (String n : bl.split(",")) {
+                if (!n.trim().isEmpty()) blacklist.add(n.trim().toLowerCase(Locale.ROOT));
+            }
         } catch (Exception ignored) {}
     }
 
@@ -58,12 +68,17 @@ public class HiAllClient implements ClientModInitializer {
             props.setProperty("text", text);
             props.setProperty("command", command);
             props.setProperty("delay", String.valueOf(delaySeconds));
+            props.setProperty("blacklist", String.join(",", blacklist));
             try (OutputStream out = Files.newOutputStream(configPath())) { props.store(out, "HiAll settings"); }
         } catch (Exception ignored) {}
     }
 
     private static int delayTicks() {
         return (int) Math.max(1, Math.round(delaySeconds * 20));
+    }
+
+    private static String blacklistText() {
+        return blacklist.isEmpty() ? "Blacklist is empty." : "Blacklist: " + String.join(", ", blacklist);
     }
 
     @Override
@@ -78,6 +93,7 @@ public class HiAllClient implements ClientModInitializer {
                 .executes(ctx -> {
                     ctx.getSource().sendFeedback(Text.literal(
                         "HiAll | text: \"" + text + "\" | delay: " + delaySeconds + "s | command: /" + command
+                        + " | blacklisted: " + blacklist.size()
                         + " | " + (running ? "running" : "paused")));
                     return 1;
                 })
@@ -103,6 +119,32 @@ public class HiAllClient implements ClientModInitializer {
                             command = StringArgumentType.getString(ctx, "name").replace("/", "");
                             save();
                             ctx.getSource().sendFeedback(Text.literal("Command set to /" + command));
+                            return 1;
+                        })))
+                .then(ClientCommandManager.literal("blacklist")
+                    .executes(ctx -> {
+                        ctx.getSource().sendFeedback(Text.literal(blacklistText()));
+                        return 1;
+                    })
+                    .then(ClientCommandManager.argument("names", StringArgumentType.greedyString())
+                        .executes(ctx -> {
+                            int added = 0;
+                            for (String n : StringArgumentType.getString(ctx, "names").trim().split("\\s+")) {
+                                if (!n.isEmpty() && blacklist.add(n.toLowerCase(Locale.ROOT))) added++;
+                            }
+                            save();
+                            ctx.getSource().sendFeedback(Text.literal("Blacklisted " + added + ". " + blacklistText()));
+                            return 1;
+                        })))
+                .then(ClientCommandManager.literal("unblacklist")
+                    .then(ClientCommandManager.argument("names", StringArgumentType.greedyString())
+                        .executes(ctx -> {
+                            int removed = 0;
+                            for (String n : StringArgumentType.getString(ctx, "names").trim().split("\\s+")) {
+                                if (blacklist.remove(n.toLowerCase(Locale.ROOT))) removed++;
+                            }
+                            save();
+                            ctx.getSource().sendFeedback(Text.literal("Removed " + removed + ". " + blacklistText()));
                             return 1;
                         })))
                 .then(ClientCommandManager.literal("reset")
@@ -132,16 +174,21 @@ public class HiAllClient implements ClientModInitializer {
             if (cooldown > 0) { cooldown--; return; }
 
             String self = mc.player.getGameProfile().getName();
+            List<String> candidates = new ArrayList<>();
             for (PlayerListEntry entry : mc.getNetworkHandler().getPlayerList()) {
                 String name = entry.getProfile().getName();
-                if (name.equals(self) || done.contains(name)) continue;
-
-                done.add(name);
-                String message = text.replace("{player}", name);
-                mc.getNetworkHandler().sendChatCommand(command + " " + name + " " + message);
-                cooldown = delayTicks();
-                return; // one player per delay
+                if (name.equalsIgnoreCase(self)) continue;
+                if (done.contains(name)) continue;
+                if (blacklist.contains(name.toLowerCase(Locale.ROOT))) continue;
+                candidates.add(name);
             }
+            if (candidates.isEmpty()) return; // nobody left; waits for new players
+
+            String name = candidates.get(ThreadLocalRandom.current().nextInt(candidates.size()));
+            done.add(name);
+            String message = text.replace("{player}", name);
+            mc.getNetworkHandler().sendChatCommand(command + " " + name + " " + message);
+            cooldown = delayTicks();
         });
     }
 }
